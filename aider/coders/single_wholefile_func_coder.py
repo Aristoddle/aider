@@ -10,7 +10,7 @@ class SingleWholeFileFunctionCoder(Coder):
         dict(
             name="write_file",
             description="write new content into the file",
-            parameters=dict(
+            parameters=dict(x
                 type="object",
                 required=["explanation", "content"],
                 properties=dict(
