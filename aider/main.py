@@ -1,14 +1,19 @@
+import configparser
 import os
+import re
 import sys
 from pathlib import Path
 
-import configargparse
 import git
-import openai
+from dotenv import load_dotenv
+from streamlit.web import cli
 
-from aider import __version__, models
+from aider import __version__, models, utils
+from aider.args import get_parser
 from aider.coders import Coder
+from aider.commands import SwitchModel
 from aider.io import InputOutput
+from aider.litellm import litellm  # noqa: F401; properly init litellm on launch
 from aider.repo import GitRepo
 from aider.versioncheck import check_version
 
@@ -44,27 +49,40 @@ def guessed_wrong_repo(io, git_root, fnames, git_dname):
 
 
 def setup_git(git_root, io):
+    repo = None
     if git_root:
-        return git_root
+        repo = git.Repo(git_root)
+    elif io.confirm_ask("No git repo found, create one to track GPT's changes (recommended)?"):
+        git_root = str(Path.cwd().resolve())
+        repo = git.Repo.init(git_root)
+        io.tool_output("Git repository created in the current working directory.")
+        check_gitignore(git_root, io, False)
 
-    if not io.confirm_ask("No git repo found, create one to track GPT's changes (recommended)?"):
+    if not repo:
         return
 
-    git_root = str(Path.cwd().resolve())
+    user_name = None
+    user_email = None
+    with repo.config_reader() as config:
+        try:
+            user_name = config.get_value("user", "name", None)
+        except configparser.NoSectionError:
+            pass
+        try:
+            user_email = config.get_value("user", "email", None)
+        except configparser.NoSectionError:
+            pass
 
-    check_gitignore(git_root, io, False)
+    if user_name and user_email:
+        return repo.working_tree_dir
 
-    repo = git.Repo.init(git_root)
-    global_git_config = git.GitConfigParser([str(Path.home() / ".gitconfig")], read_only=True)
     with repo.config_writer() as git_config:
-        if not global_git_config.has_option("user", "name"):
+        if not user_name:
             git_config.set_value("user", "name", "Your Name")
-            io.tool_error('Update git name with: git config --global user.name "Your Name"')
-        if not global_git_config.has_option("user", "email"):
+            io.tool_error('Update git name with: git config user.name "Your Name"')
+        if not user_email:
             git_config.set_value("user", "email", "you@example.com")
-            io.tool_error('Update git email with: git config --global user.email "you@example.com"')
-
-    io.tool_output("Git repository created in the current working directory.")
+            io.tool_error('Update git email with: git config user.email "you@example.com"')
 
     return repo.working_tree_dir
 
@@ -73,11 +91,20 @@ def check_gitignore(git_root, io, ask=True):
     if not git_root:
         return
 
+    try:
+        repo = git.Repo(git_root)
+        if repo.ignored(".aider"):
+            return
+    except git.exc.InvalidGitRepositoryError:
+        pass
+
     pat = ".aider*"
 
     gitignore_file = Path(git_root) / ".gitignore"
     if gitignore_file.exists():
         content = io.read_text(gitignore_file)
+        if content is None:
+            return
         if pat in content.splitlines():
             return
     else:
@@ -94,7 +121,91 @@ def check_gitignore(git_root, io, ask=True):
     io.tool_output(f"Added {pat} to .gitignore")
 
 
-def main(argv=None, input=None, output=None, force_git_root=None):
+def format_settings(parser, args):
+    show = scrub_sensitive_info(args, parser.format_values())
+    show += "\n"
+    show += "Option settings:\n"
+    for arg, val in sorted(vars(args).items()):
+        if val:
+            val = scrub_sensitive_info(args, str(val))
+        show += f"  - {arg}: {val}\n"
+    return show
+
+
+def scrub_sensitive_info(args, text):
+    # Replace sensitive information with placeholder
+    if text and args.openai_api_key:
+        text = text.replace(args.openai_api_key, "***")
+    if text and args.anthropic_api_key:
+        text = text.replace(args.anthropic_api_key, "***")
+    return text
+
+
+def launch_gui(args):
+    from aider import gui
+
+    print()
+    print("CONTROL-C to exit...")
+
+    target = gui.__file__
+
+    st_args = ["run", target]
+
+    st_args += [
+        "--browser.gatherUsageStats=false",
+        "--runner.magicEnabled=false",
+        "--server.runOnSave=false",
+    ]
+
+    if "-dev" in __version__:
+        print("Watching for file changes.")
+    else:
+        st_args += [
+            "--global.developmentMode=false",
+            "--server.fileWatcherType=none",
+            "--client.toolbarMode=viewer",  # minimal?
+        ]
+
+    st_args += ["--"] + args
+
+    cli.main(st_args)
+
+    # from click.testing import CliRunner
+    # runner = CliRunner()
+    # from streamlit.web import bootstrap
+    # bootstrap.load_config_options(flag_options={})
+    # cli.main_run(target, args)
+    # sys.argv = ['streamlit', 'run', '--'] + args
+
+
+def parse_lint_cmds(lint_cmds, io):
+    err = False
+    res = dict()
+    for lint_cmd in lint_cmds:
+        if re.match(r"^[a-z]+:.*", lint_cmd):
+            pieces = lint_cmd.split(":")
+            lang = pieces[0]
+            cmd = lint_cmd[len(lang) + 1 :]
+            lang = lang.strip()
+        else:
+            lang = None
+            cmd = lint_cmd
+
+        cmd = cmd.strip()
+
+        if cmd:
+            res[lang] = cmd
+        else:
+            io.tool_error(f'Unable to parse --lint-cmd "{lint_cmd}"')
+            io.tool_error('The arg should be "language: cmd --args ..."')
+            io.tool_error('For example: --lint-cmd "python: flake8 --select=E9"')
+            err = True
+    if err:
+        return
+    return res
+
+
+def main(argv=None, input=None, output=None, force_git_root=None, return_coder=False):
     if argv is None:
         argv = sys.argv[1:]
 
@@ -113,264 +224,12 @@ def main(argv=None, input=None, output=None, force_git_root=None):
     default_config_files.append(Path.home() / conf_fname)  # homedir
     default_config_files = list(map(str, default_config_files))
 
-    parser = configargparse.ArgumentParser(
-        description="aider is GPT powered coding in your terminal",
-        add_config_file_help=True,
-        default_config_files=default_config_files,
-        config_file_parser_class=configargparse.YAMLConfigFileParser,
-        auto_env_var_prefix="AIDER_",
-    )
-
-    ##########
-    core_group = parser.add_argument_group("Main")
-    core_group.add_argument(
-        "files",
-        metavar="FILE",
-        nargs="*",
-        help="the directory of a git repo, or a list of files to edit with GPT (optional)",
-    )
-    core_group.add_argument(
-        "--openai-api-key",
-        metavar="OPENAI_API_KEY",
-        help="Specify the OpenAI API key",
-        env_var="OPENAI_API_KEY",
-    )
-    core_group.add_argument(
-        "--model",
-        metavar="MODEL",
-        default=models.GPT4.name,
-        help=f"Specify the model to use for the main chat (default: {models.GPT4.name})",
-    )
-    core_group.add_argument(
-        "-3",
-        action="store_const",
-        dest="model",
-        const=models.GPT35_16k.name,
-        help=f"Use {models.GPT35_16k.name} model for the main chat (gpt-4 is better)",
-    )
-
-    ##########
-    model_group = parser.add_argument_group("Advanced Model Settings")
-    model_group.add_argument(
-        "--openai-api-base",
-        metavar="OPENAI_API_BASE",
-        help="Specify the openai.api_base (default: https://api.openai.com/v1)",
-    )
-    model_group.add_argument(
-        "--openai-api-type",
-        metavar="OPENAI_API_TYPE",
-        help="Specify the openai.api_type",
-    )
-    model_group.add_argument(
-        "--openai-api-version",
-        metavar="OPENAI_API_VERSION",
-        help="Specify the openai.api_version",
-    )
-    model_group.add_argument(
-        "--openai-api-deployment-id",
-        metavar="OPENAI_API_DEPLOYMENT_ID",
-        help="Specify the deployment_id arg to be passed to openai.ChatCompletion.create()",
-    )
-    model_group.add_argument(
-        "--openai-api-engine",
-        metavar="OPENAI_API_ENGINE",
-        help="Specify the engine arg to be passed to openai.ChatCompletion.create()",
-    )
-    model_group.add_argument(
-        "--edit-format",
-        metavar="EDIT_FORMAT",
-        default=None,
-        help="Specify what edit format GPT should use (default depends on model)",
-    )
-    model_group.add_argument(
-        "--map-tokens",
-        type=int,
-        default=1024,
-        help="Max number of tokens to use for repo map, use 0 to disable (default: 1024)",
-    )
-
-    ##########
-    history_group = parser.add_argument_group("History Files")
-    default_input_history_file = (
-        os.path.join(git_root, ".aider.input.history") if git_root else ".aider.input.history"
-    )
-    default_chat_history_file = (
-        os.path.join(git_root, ".aider.chat.history.md") if git_root else ".aider.chat.history.md"
-    )
-    history_group.add_argument(
-        "--input-history-file",
-        metavar="INPUT_HISTORY_FILE",
-        default=default_input_history_file,
-        help=f"Specify the chat input history file (default: {default_input_history_file})",
-    )
-    history_group.add_argument(
-        "--chat-history-file",
-        metavar="CHAT_HISTORY_FILE",
-        default=default_chat_history_file,
-        help=f"Specify the chat history file (default: {default_chat_history_file})",
-    )
-
-    ##########
-    output_group = parser.add_argument_group("Output Settings")
-    output_group.add_argument(
-        "--dark-mode",
-        action="store_true",
-        help="Use colors suitable for a dark terminal background (default: False)",
-        default=False,
-    )
-    output_group.add_argument(
-        "--light-mode",
-        action="store_true",
-        help="Use colors suitable for a light terminal background (default: False)",
-        default=False,
-    )
-    output_group.add_argument(
-        "--pretty",
-        action="store_true",
-        default=True,
-        help="Enable pretty, colorized output (default: True)",
-    )
-    output_group.add_argument(
-        "--no-pretty",
-        action="store_false",
-        dest="pretty",
-        help="Disable pretty, colorized output",
-    )
-    output_group.add_argument(
-        "--no-stream",
-        action="store_false",
-        dest="stream",
-        default=True,
-        help="Disable streaming responses",
-    )
-    output_group.add_argument(
-        "--user-input-color",
-        default="#00cc00",
-        help="Set the color for user input (default: #00cc00)",
-    )
-    output_group.add_argument(
-        "--tool-output-color",
-        default=None,
-        help="Set the color for tool output (default: None)",
-    )
-    output_group.add_argument(
-        "--tool-error-color",
-        default="#FF2222",
-        help="Set the color for tool error messages (default: red)",
-    )
-    output_group.add_argument(
-        "--assistant-output-color",
-        default="#0088ff",
-        help="Set the color for assistant output (default: #0088ff)",
-    )
-    output_group.add_argument(
-        "--code-theme",
-        default="default",
-        help=(
-            "Set the markdown code theme (default: default, other options include monokai,"
-            " solarized-dark, solarized-light)"
-        ),
-    )
-    output_group.add_argument(
-        "--show-diffs",
-        action="store_true",
-        help="Show diffs when committing changes (default: False)",
-        default=False,
-    )
-
-    ##########
-    git_group = parser.add_argument_group("Git Settings")
-    git_group.add_argument(
-        "--no-git",
-        action="store_false",
-        dest="git",
-        default=True,
-        help="Do not look for a git repo",
-    )
-    git_group.add_argument(
-        "--auto-commits",
-        action="store_true",
-        dest="auto_commits",
-        default=True,
-        help="Enable auto commit of GPT changes (default: True)",
-    )
-    git_group.add_argument(
-        "--no-auto-commits",
-        action="store_false",
-        dest="auto_commits",
-        help="Disable auto commit of GPT changes (implies --no-dirty-commits)",
-    )
-    git_group.add_argument(
-        "--dirty-commits",
-        action="store_true",
-        dest="dirty_commits",
-        help="Enable commits when repo is found dirty",
-        default=True,
-    )
-    git_group.add_argument(
-        "--no-dirty-commits",
-        action="store_false",
-        dest="dirty_commits",
-        help="Disable commits when repo is found dirty",
-    )
-    git_group.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Perform a dry run without modifying files (default: False)",
-        default=False,
-    )
-
-    ##########
-    other_group = parser.add_argument_group("Other Settings")
-    other_group.add_argument(
-        "--version",
-        action="version",
-        version=f"%(prog)s {__version__}",
-        help="Show the version number and exit",
-    )
-    other_group.add_argument(
-        "--apply",
-        metavar="FILE",
-        help="Apply the changes from the given file instead of running the chat (debug)",
-    )
-    other_group.add_argument(
-        "--yes",
-        action="store_true",
-        help="Always say yes to every confirmation",
-        default=None,
-    )
-    other_group.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Enable verbose output",
-        default=False,
-    )
-    other_group.add_argument(
-        "--show-repo-map",
-        action="store_true",
-        help="Print the repo map and exit (debug)",
-        default=False,
-    )
-    other_group.add_argument(
-        "--message",
-        "--msg",
-        "-m",
-        metavar="COMMAND",
-        help="Specify a single message to send GPT, process reply then exit (disables chat mode)",
-    )
-    other_group.add_argument(
-        "-c",
-        "--config",
-        is_config_file=True,
-        metavar="CONFIG_FILE",
-        help=(
-            "Specify the config file (default: search for .aider.conf.yml in git root, cwd"
-            " or home directory)"
-        ),
-    )
-
+    parser = get_parser(default_config_files, git_root)
     args = parser.parse_args(argv)
+
+    if args.gui and not return_coder:
+        launch_gui(argv)
+        return
 
     if args.dark_mode:
         args.user_input_color = "#32FF32"
@@ -384,6 +243,9 @@ def main(argv=None, input=None, output=None, force_git_root=None):
         args.assistant_output_color = "blue"
         args.code_theme = "default"
 
+    if return_coder and args.yes is None:
+        args.yes = True
+
     io = InputOutput(
         args.pretty,
         args.yes,
@@ -395,6 +257,7 @@ def main(argv=None, input=None, output=None, force_git_root=None):
         tool_output_color=args.tool_output_color,
         tool_error_color=args.tool_error_color,
         dry_run=args.dry_run,
+        encoding=args.encoding,
     )
 
     fnames = [str(Path(fn).resolve()) for fn in args.files]
@@ -426,60 +289,63 @@ def main(argv=None, input=None, output=None, force_git_root=None):
     if args.git and not force_git_root:
         right_repo_root = guessed_wrong_repo(io, git_root, fnames, git_dname)
         if right_repo_root:
-            return main(argv, input, output, right_repo_root)
+            return main(argv, input, output, right_repo_root, return_coder=return_coder)
 
-    io.tool_output(f"Aider v{__version__}")
+    if not args.skip_check_update:
+        check_version(io.tool_error)
 
-    check_version(io.tool_error)
+    if args.check_update:
+        update_available = check_version(lambda msg: None)
+        return 0 if not update_available else 1
 
-    if "VSCODE_GIT_IPC_HANDLE" in os.environ:
-        args.pretty = False
-        io.tool_output("VSCode terminal detected, pretty output has been disabled.")
+    if args.models:
+        models.print_matching_models(io, args.models)
+        return 0
 
     if args.git:
         git_root = setup_git(git_root, io)
-        check_gitignore(git_root, io)
-
-    def scrub_sensitive_info(text):
-        # Replace sensitive information with placeholder
-        return text.replace(args.openai_api_key, "***")
+        if args.gitignore:
+            check_gitignore(git_root, io)
 
     if args.verbose:
-        show = scrub_sensitive_info(parser.format_values())
+        show = format_settings(parser, args)
         io.tool_output(show)
-        io.tool_output("Option settings:")
-        for arg, val in sorted(vars(args).items()):
-            io.tool_output(f"  - {arg}: {scrub_sensitive_info(str(val))}")
 
-    io.tool_output(*sys.argv, log_only=True)
+    cmd_line = " ".join(sys.argv)
+    cmd_line = scrub_sensitive_info(args, cmd_line)
+    io.tool_output(cmd_line, log_only=True)
 
-    if not args.openai_api_key:
-        if os.name == "nt":
-            io.tool_error(
-                "No OpenAI API key provided. Use --openai-api-key or setx OPENAI_API_KEY."
-            )
-        else:
-            io.tool_error(
-                "No OpenAI API key provided. Use --openai-api-key or export OPENAI_API_KEY."
-            )
+    if args.env_file:
+        load_dotenv(args.env_file)
+
+    if args.anthropic_api_key:
+        os.environ["ANTHROPIC_API_KEY"] = args.anthropic_api_key
+
+    if args.openai_api_key:
+        os.environ["OPENAI_API_KEY"] = args.openai_api_key
+    if args.openai_api_base:
+        os.environ["OPENAI_API_BASE"] = args.openai_api_base
+    if args.openai_api_version:
+        os.environ["OPENAI_API_VERSION"] = args.openai_api_version
+    if args.openai_api_type:
+        os.environ["OPENAI_API_TYPE"] = args.openai_api_type
+    if args.openai_organization_id:
+        os.environ["OPENAI_ORGANIZATION"] = args.openai_organization_id
+
+    main_model = models.Model(args.model, weak_model=args.weak_model)
+
+    lint_cmds = parse_lint_cmds(args.lint_cmd, io)
+    if lint_cmds is None:
         return 1
 
-    main_model = models.Model(args.model)
-
-    openai.api_key = args.openai_api_key
-    for attr in ("base", "type", "version", "deployment_id", "engine"):
-        arg_key = f"openai_api_{attr}"
-        val = getattr(args, arg_key)
-        if val is not None:
-            mod_key = f"api_{attr}"
-            setattr(openai, mod_key, val)
-            io.tool_output(f"Setting openai.{mod_key}={val}")
+    if args.show_model_warnings:
+        models.sanity_check_models(io, main_model)
 
     try:
         coder = Coder.create(
-            main_model,
-            args.edit_format,
-            io,
+            main_model=main_model,
+            edit_format=args.edit_format,
+            io=io,
             ##
             fnames=fnames,
             git_dname=git_dname,
@@ -494,10 +360,49 @@ def main(argv=None, input=None, output=None, force_git_root=None):
             code_theme=args.code_theme,
             stream=args.stream,
             use_git=args.git,
+            voice_language=args.voice_language,
+            aider_ignore_file=args.aiderignore,
+            max_chat_history_tokens=args.max_chat_history_tokens,
+            restore_chat_history=args.restore_chat_history,
+            auto_lint=args.auto_lint,
+            auto_test=args.auto_test,
+            lint_cmds=lint_cmds,
+            test_cmd=args.test_cmd,
         )
+
     except ValueError as err:
         io.tool_error(str(err))
         return 1
+
+    if return_coder:
+        return coder
+
+    coder.show_announcements()
+
+    if args.show_prompts:
+        coder.cur_messages += [
+            dict(role="user", content="Hello!"),
+        ]
+        messages = coder.format_messages()
+        utils.show_messages(messages)
+        return
+
+    if args.commit:
+        coder.commands.cmd_commit()
+        return
+
+    if args.lint:
+        coder.commands.cmd_lint(fnames=fnames)
+        return
+
+    if args.test:
+        if not args.test_cmd:
+            io.tool_error("No --test-cmd provided.")
+            return 1
+        test_errors = coder.commands.cmd_test(args.test_cmd)
+        if test_errors:
+            coder.run(test_errors)
+        return
 
     if args.show_repo_map:
         repo_map = coder.get_repo_map()
@@ -509,18 +414,51 @@ def main(argv=None, input=None, output=None, force_git_root=None):
         content = io.read_text(args.apply)
         if content is None:
             return
-        coder.apply_updates(content)
+        coder.partial_response_content = content
+        coder.apply_updates()
         return
+
+    if "VSCODE_GIT_IPC_HANDLE" in os.environ:
+        args.pretty = False
+        io.tool_output("VSCode terminal detected, pretty output has been disabled.")
 
     io.tool_output("Use /help to see in-chat commands, run with --help to see cmd line args")
 
-    coder.dirty_commit()
+    if git_root and Path.cwd().resolve() != Path(git_root).resolve():
+        io.tool_error(
+            "Note: in-chat filenames are always relative to the git working dir, not the current"
+            " working dir."
+        )
+
+        io.tool_error(f"Cur working dir: {Path.cwd()}")
+        io.tool_error(f"Git working dir: {git_root}")
 
     if args.message:
+        io.add_to_input_history(args.message)
         io.tool_output()
         coder.run(with_message=args.message)
-    else:
-        coder.run()
+        return
+
+    if args.message_file:
+        try:
+            message_from_file = io.read_text(args.message_file)
+            io.tool_output()
+            coder.run(with_message=message_from_file)
+        except FileNotFoundError:
+            io.tool_error(f"Message file not found: {args.message_file}")
+            return 1
+        except IOError as e:
+            io.tool_error(f"Error reading message file: {e}")
+            return 1
+        return
+
+    while True:
+        try:
+            coder.run()
+            return
+        except SwitchModel as switch:
+            coder = Coder.create(main_model=switch.model, io=io, from_coder=coder)
+            coder.show_announcements()
 
 
 if __name__ == "__main__":

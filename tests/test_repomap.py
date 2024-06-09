@@ -1,13 +1,17 @@
 import os
 import unittest
-from unittest.mock import patch
 
+from aider.dump import dump  # noqa: F401
 from aider.io import InputOutput
+from aider.models import Model
 from aider.repomap import RepoMap
-from tests.utils import IgnorantTemporaryDirectory
+from aider.utils import IgnorantTemporaryDirectory
 
 
 class TestRepoMap(unittest.TestCase):
+    def setUp(self):
+        self.GPT35 = Model("gpt-3.5-turbo")
+
     def test_get_repo_map(self):
         # Create a temporary directory with sample files for testing
         test_files = [
@@ -23,7 +27,7 @@ class TestRepoMap(unittest.TestCase):
                     f.write("")
 
             io = InputOutput()
-            repo_map = RepoMap(root=temp_dir, io=io)
+            repo_map = RepoMap(main_model=self.GPT35, root=temp_dir, io=io)
             other_files = [os.path.join(temp_dir, file) for file in test_files]
             result = repo_map.get_repo_map([], other_files)
 
@@ -71,7 +75,7 @@ print(my_function(3, 4))
                 f.write(file_content3)
 
             io = InputOutput()
-            repo_map = RepoMap(root=temp_dir, io=io)
+            repo_map = RepoMap(main_model=self.GPT35, root=temp_dir, io=io)
             other_files = [
                 os.path.join(temp_dir, test_file1),
                 os.path.join(temp_dir, test_file2),
@@ -89,33 +93,9 @@ print(my_function(3, 4))
             # close the open cache files, so Windows won't error
             del repo_map
 
-    def test_check_for_ctags_failure(self):
-        with patch("subprocess.run") as mock_run:
-            mock_run.side_effect = Exception("ctags not found")
-            repo_map = RepoMap(io=InputOutput())
-            self.assertFalse(repo_map.has_ctags)
-
-    def test_check_for_ctags_success(self):
-        with patch("subprocess.check_output") as mock_run:
-            mock_run.side_effect = [
-                (
-                    b"Universal Ctags 0.0.0(f25b4bb7)\n  Optional compiled features: +wildcards,"
-                    b" +regex, +gnulib_fnmatch, +gnulib_regex, +iconv, +option-directory, +xpath,"
-                    b" +json, +interactive, +yaml, +case-insensitive-filenames, +packcc,"
-                    b" +optscript, +pcre2"
-                ),
-                (
-                    b'{"_type": "tag", "name": "status", "path": "aider/main.py", "pattern": "/^   '
-                    b' status = main()$/", "kind": "variable"}'
-                ),
-            ]
-            repo_map = RepoMap(io=InputOutput())
-            self.assertTrue(repo_map.has_ctags)
-
-    def test_get_repo_map_without_ctags(self):
-        # Create a temporary directory with a sample Python file containing identifiers
+    def test_get_repo_map_all_files(self):
         test_files = [
-            "test_file_without_ctags.py",
+            "test_file0.py",
             "test_file1.txt",
             "test_file2.md",
             "test_file3.json",
@@ -129,15 +109,105 @@ print(my_function(3, 4))
                 with open(os.path.join(temp_dir, file), "w") as f:
                     f.write("")
 
-            repo_map = RepoMap(root=temp_dir, io=InputOutput())
-            repo_map.has_ctags = False  # force it off
+            repo_map = RepoMap(main_model=self.GPT35, root=temp_dir, io=InputOutput())
 
             other_files = [os.path.join(temp_dir, file) for file in test_files]
             result = repo_map.get_repo_map([], other_files)
+            dump(other_files)
+            dump(repr(result))
 
             # Check if the result contains each specific file in the expected tags map without ctags
             for file in test_files:
                 self.assertIn(file, result)
+
+            # close the open cache files, so Windows won't error
+            del repo_map
+
+    def test_get_repo_map_excludes_added_files(self):
+        # Create a temporary directory with sample files for testing
+        test_files = [
+            "test_file1.py",
+            "test_file2.py",
+            "test_file3.md",
+            "test_file4.json",
+        ]
+
+        with IgnorantTemporaryDirectory() as temp_dir:
+            for file in test_files:
+                with open(os.path.join(temp_dir, file), "w") as f:
+                    f.write("def foo(): pass\n")
+
+            io = InputOutput()
+            repo_map = RepoMap(main_model=self.GPT35, root=temp_dir, io=io)
+            test_files = [os.path.join(temp_dir, file) for file in test_files]
+            result = repo_map.get_repo_map(test_files[:2], test_files[2:])
+
+            dump(result)
+
+            # Check if the result contains the expected tags map
+            self.assertNotIn("test_file1.py", result)
+            self.assertNotIn("test_file2.py", result)
+            self.assertIn("test_file3.md", result)
+            self.assertIn("test_file4.json", result)
+
+            # close the open cache files, so Windows won't error
+            del repo_map
+
+
+class TestRepoMapTypescript(unittest.TestCase):
+    def setUp(self):
+        self.GPT35 = Model("gpt-3.5-turbo")
+
+    def test_get_repo_map_typescript(self):
+        # Create a temporary directory with a sample TypeScript file
+        test_file_ts = "test_file.ts"
+        file_content_ts = """\
+interface IMyInterface {
+    someMethod(): void;
+}
+
+type ExampleType = {
+    key: string;
+    value: number;
+};
+
+enum Status {
+    New,
+    InProgress,
+    Completed,
+}
+
+export class MyClass {
+    constructor(public value: number) {}
+
+    add(input: number): number {
+        return this.value + input;
+        return this.value + input;
+    }
+}
+
+export function myFunction(input: number): number {
+    return input * 2;
+}
+"""
+
+        with IgnorantTemporaryDirectory() as temp_dir:
+            with open(os.path.join(temp_dir, test_file_ts), "w") as f:
+                f.write(file_content_ts)
+
+            io = InputOutput()
+            repo_map = RepoMap(main_model=self.GPT35, root=temp_dir, io=io)
+            other_files = [os.path.join(temp_dir, test_file_ts)]
+            result = repo_map.get_repo_map([], other_files)
+
+            # Check if the result contains the expected tags map with TypeScript identifiers
+            self.assertIn("test_file.ts", result)
+            self.assertIn("IMyInterface", result)
+            self.assertIn("ExampleType", result)
+            self.assertIn("Status", result)
+            self.assertIn("MyClass", result)
+            self.assertIn("add", result)
+            self.assertIn("myFunction", result)
 
             # close the open cache files, so Windows won't error
             del repo_map

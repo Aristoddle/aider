@@ -1,3 +1,4 @@
+import base64
 import os
 from collections import defaultdict
 from datetime import datetime
@@ -16,6 +17,7 @@ from rich.console import Console
 from rich.text import Text
 
 from .dump import dump  # noqa: F401
+from .utils import is_image_file
 
 
 class AutoCompleter(Completer):
@@ -44,7 +46,7 @@ class AutoCompleter(Completer):
             try:
                 with open(fname, "r", encoding=self.encoding) as f:
                     content = f.read()
-            except FileNotFoundError:
+            except (FileNotFoundError, UnicodeDecodeError, IsADirectoryError):
                 continue
             try:
                 lexer = guess_lexer_for_filename(fname, content)
@@ -139,12 +141,33 @@ class InputOutput:
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.append_chat_history(f"\n# aider chat started at {current_time}\n\n")
 
+    def read_image(self, filename):
+        try:
+            with open(str(filename), "rb") as image_file:
+                encoded_string = base64.b64encode(image_file.read())
+                return encoded_string.decode("utf-8")
+        except FileNotFoundError:
+            self.tool_error(f"{filename}: file not found error")
+            return
+        except IsADirectoryError:
+            self.tool_error(f"{filename}: is a directory")
+            return
+        except Exception as e:
+            self.tool_error(f"{filename}: {e}")
+            return
+
     def read_text(self, filename):
+        if is_image_file(filename):
+            return self.read_image(filename)
+
         try:
             with open(str(filename), "r", encoding=self.encoding) as f:
                 return f.read()
         except FileNotFoundError:
             self.tool_error(f"{filename}: file not found error")
+            return
+        except IsADirectoryError:
+            self.tool_error(f"{filename}: is a directory")
             return
         except UnicodeError as e:
             self.tool_error(f"{filename}: {e}")
@@ -231,7 +254,23 @@ class InputOutput:
         self.user_input(inp)
         return inp
 
-    def user_input(self, inp):
+    def add_to_input_history(self, inp):
+        if not self.input_history_file:
+            return
+        FileHistory(self.input_history_file).append_string(inp)
+
+    def get_input_history(self):
+        if not self.input_history_file:
+            return []
+
+        fh = FileHistory(self.input_history_file)
+        return fh.load_history_strings()
+
+    def user_input(self, inp, log_only=True):
+        if not log_only:
+            style = dict(style=self.user_input_color) if self.user_input_color else dict()
+            self.console.print(inp, **style)
+
         prefix = "####"
         if inp:
             hist = inp.splitlines()
@@ -262,8 +301,6 @@ class InputOutput:
 
         hist = f"{question.strip()} {res.strip()}"
         self.append_chat_history(hist, linebreak=True, blockquote=True)
-        if self.yes in (True, False):
-            self.tool_output(hist)
 
         if not res or not res.strip():
             return
@@ -286,12 +323,19 @@ class InputOutput:
 
         return res
 
-    def tool_error(self, message):
+    def tool_error(self, message="", strip=True):
         self.num_error_outputs += 1
 
         if message.strip():
-            hist = f"{message.strip()}"
-            self.append_chat_history(hist, linebreak=True, blockquote=True)
+            if "\n" in message:
+                for line in message.splitlines():
+                    self.append_chat_history(line, linebreak=True, blockquote=True, strip=strip)
+            else:
+                if strip:
+                    hist = message.strip()
+                else:
+                    hist = message
+                self.append_chat_history(hist, linebreak=True, blockquote=True)
 
         message = Text(message)
         style = dict(style=self.tool_error_color) if self.tool_error_color else dict()
@@ -308,12 +352,14 @@ class InputOutput:
             style = dict(style=self.tool_output_color) if self.tool_output_color else dict()
             self.console.print(*messages, **style)
 
-    def append_chat_history(self, text, linebreak=False, blockquote=False):
+    def append_chat_history(self, text, linebreak=False, blockquote=False, strip=True):
         if blockquote:
-            text = text.strip()
+            if strip:
+                text = text.strip()
             text = "> " + text
         if linebreak:
-            text = text.rstrip()
+            if strip:
+                text = text.rstrip()
             text = text + "  \n"
         if not text.endswith("\n"):
             text += "\n"

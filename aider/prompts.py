@@ -11,9 +11,15 @@ Reply with JUST the commit message, without quotes, comments, questions, etc!
 """
 
 # COMMANDS
-undo_command_reply = "I did `git reset --hard HEAD~1` to discard the last edits."
+undo_command_reply = (
+    "I did `git reset --hard HEAD~1` to discard the last edits. Please wait for further"
+    " instructions before attempting that change again. Feel free to ask relevant questions about"
+    " why the changes were reverted."
+)
 
-added_files = "I added these *read-write* files: {fnames}"
+added_files = """I added these files to the chat: {fnames}.
+
+If you need to propose edits to other existing files not already added to the chat, you *MUST* tell the me their full path names and ask me to *add the files to the chat*. End your reply and wait for my approval. You can keep asking if you then decide you need to edit more files."""
 
 
 run_output = """I ran this command:

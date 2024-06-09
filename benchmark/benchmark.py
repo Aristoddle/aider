@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 import datetime
 import json
 import os
@@ -8,6 +7,7 @@ import re
 import shutil
 import subprocess
 import time
+import traceback
 from collections import defaultdict
 from json.decoder import JSONDecodeError
 from pathlib import Path
@@ -16,13 +16,11 @@ from typing import List
 
 import git
 import lox
-import matplotlib.pyplot as plt
-import numpy as np
-import openai
 import pandas as pd
 import prompts
 import typer
-from imgcat import imgcat
+from dotenv import load_dotenv
+from plots import plot_refactoring
 from rich.console import Console
 
 from aider import models
@@ -30,52 +28,34 @@ from aider.coders import Coder
 from aider.dump import dump  # noqa: F401
 from aider.io import InputOutput
 
-BENCHMARK_DNAME = Path(os.environ["AIDER_BENCHMARK_DIR"])
+load_dotenv()
 
-ORIGINAL_DNAME = BENCHMARK_DNAME / "exercism-python"
+BENCHMARK_DNAME = Path(os.environ.get("AIDER_BENCHMARK_DIR", "tmp.benchmarks"))
+
+EXERCISES_DIR_DEFAULT = "exercism-python"
 
 app = typer.Typer(add_completion=False, pretty_exceptions_enable=False)
 
 
-def show_stats(dirnames):
+NUM_TESTS = (89, 133)
+
+
+def show_stats(dirnames, graphs):
     raw_rows = []
     for dirname in dirnames:
         row = summarize_results(dirname)
         raw_rows.append(row)
 
-    return
+    # return
 
-    repeats = []
     seen = dict()
     rows = []
     for row in raw_rows:
         if not row:
             continue
 
-        if row.model == "gpt-3.5-turbo":
-            row.model = "gpt-3.5-turbo-0613"
-        if row.edit_format == "diff-func-string":
-            row.edit_format = "diff-func"
-
-        if (
-            row.model == "gpt-3.5-turbo-0613"
-            and row.edit_format == "whole"
-            and "repeat" not in row.dir_name
-        ):
-            # remember this row, so we can update it with the repeat_avg
-            repeat_row = len(rows)
-
-        pieces = row.model.split("-")
-        row.model = "-".join(pieces[:3])
-        if pieces[3:]:
-            row.model += "\n-" + "-".join(pieces[3:])
-
-        if row.completed_tests < 133:
+        if row.completed_tests not in NUM_TESTS:
             print(f"Warning: {row.dir_name} is incomplete: {row.completed_tests}")
-
-        if "repeat" in row.dir_name:
-            repeats.append(vars(row))
-            continue
 
         kind = (row.model, row.edit_format)
         if kind in seen:
@@ -86,127 +66,17 @@ def show_stats(dirnames):
         seen[kind] = row.dir_name
         rows.append(vars(row))
 
-    if repeats:
-        extra = rows[repeat_row]
-        dump(extra)
-        repeats.append(extra)
-        repeats = pd.DataFrame.from_records(repeats)
-        repeat_max = repeats["pass_rate_2"].max()
-        repeat_min = repeats["pass_rate_2"].min()
-        repeat_avg = repeats["pass_rate_2"].mean()
-
-        repeat_lo = repeat_avg - repeat_min
-        repeat_hi = repeat_max - repeat_avg
-
-        dump(repeat_max)
-        dump(repeat_min)
-        dump(repeat_avg)
-
-        # use the average in the main bar
-        rows[repeat_row]["pass_rate_2"] = repeat_avg
+    repeat_hi = repeat_lo = repeat_avg = None  # noqa: F841
 
     df = pd.DataFrame.from_records(rows)
-    df.sort_values(by=["model", "edit_format"], inplace=True)
+    # df.sort_values(by=["model", "edit_format"], inplace=True)
 
-    tries = [df.groupby(["model", "edit_format"])["pass_rate_2"].mean()]
-    if True:
-        tries += [df.groupby(["model", "edit_format"])["pass_rate_1"].mean()]
-
-    plt.rcParams["hatch.linewidth"] = 0.5
-    plt.rcParams["hatch.color"] = "#444444"
-
-    from matplotlib import rc
-
-    rc("font", **{"family": "sans-serif", "sans-serif": ["Helvetica"], "size": 10})
-
-    fig, ax = plt.subplots(figsize=(6, 4))
-    ax.grid(axis="y", zorder=0, lw=0.2)
-
-    zorder = 1
-    for grouped in tries:
-        zorder += 1
-        df = grouped.unstack()
-        num_models, num_formats = df.shape
-
-        pos = np.array(range(num_models))
-        width = 0.8 / num_formats
-
-        formats = df.columns
-        models = df.index
-
-        for i, fmt in enumerate(formats):
-            if zorder > 1:
-                edge = dict(
-                    edgecolor="#ffffff",
-                    linewidth=1.5,
-                )
-            else:
-                edge = dict()
-            if zorder == 2:
-                edge["label"] = fmt
-
-            color = "#b3e6a8" if "diff" in fmt else "#b3d1e6"
-            hatch = "////" if "func" in fmt else ""
-            rects = ax.bar(
-                pos + i * width,
-                df[fmt],
-                width * 0.95,
-                color=color,
-                hatch=hatch,
-                zorder=zorder,
-                **edge,
-            )
-            if zorder == 2:
-                ax.bar_label(rects, padding=4, labels=[f"{v:.0f}%" for v in df[fmt]], size=6)
-
-    if len(repeats):
-        ax.errorbar(
-            1.4,
-            repeat_avg,
-            yerr=[[repeat_lo], [repeat_hi]],
-            fmt="none",
-            zorder=5,
-            capsize=2.5,
-            elinewidth=1,
-            markeredgewidth=1,
-        )
-
-    ax.set_xticks([p + 1.5 * width for p in pos])
-    ax.set_xticklabels(models)
-
-    top = 95
-    ax.annotate(
-        "First attempt,\nbased on\ninstructions",
-        xy=(2.9, 51),
-        xytext=(2.5, top),
-        horizontalalignment="center",
-        verticalalignment="top",
-        arrowprops={"arrowstyle": "->", "connectionstyle": "arc3,rad=0.3"},
-    )
-    ax.annotate(
-        "Second attempt,\nbased on\nunit test errors",
-        xy=(3.1, 68),
-        xytext=(4.25, top),
-        horizontalalignment="center",
-        verticalalignment="top",
-        arrowprops={"arrowstyle": "->", "connectionstyle": "arc3,rad=0.3"},
-    )
-
-    ax.set_ylabel("Percent of exercises completed successfully")
-    # ax.set_xlabel("Model")
-    ax.set_title("GPT Code Editing")
-    ax.legend(
-        title="Edit Format",
-        loc="upper left",
-        # bbox_to_anchor=(0.95, 0.95),
-    )
-    ax.set_ylim(top=100)
-
-    plt.tight_layout()
-    plt.savefig("tmp.svg")
-    imgcat(fig)
-
-    # df.to_csv("tmp.benchmarks.csv")
+    # dump(df)
+    if graphs:
+        # plot_timing(df)
+        # plot_outcomes(df, repeats, repeat_hi, repeat_lo, repeat_avg)
+        # plot_outcomes_claude(df)
+        plot_refactoring(df)
 
 
 def resolve_dirname(dirname, use_single_prior, make_new):
@@ -237,10 +107,21 @@ def resolve_dirname(dirname, use_single_prior, make_new):
 @app.command()
 def main(
     dirnames: List[str] = typer.Argument(..., help="Directory names"),
+    graphs: bool = typer.Option(False, "--graphs", help="Generate graphs"),
     model: str = typer.Option("gpt-3.5-turbo", "--model", "-m", help="Model name"),
     edit_format: str = typer.Option(None, "--edit-format", "-e", help="Edit format"),
-    keyword: str = typer.Option(
-        None, "--keyword", "-k", help="Only run tests that contain keyword"
+    replay: str = typer.Option(
+        None,
+        "--replay",
+        help="Replay previous .aider.chat.history.md responses from previous benchmark run",
+    ),
+    max_apply_update_errors: int = typer.Option(
+        3,
+        "--max-apply-update-errors",
+        help="Maximum number of apply update errors before stopping the test",
+    ),
+    keywords: str = typer.Option(
+        None, "--keywords", "-k", help="Only run tests that contain keywords (comma sep)"
     ),
     clean: bool = typer.Option(
         False, "--clean", "-c", help="Discard the existing testdir and make a clean copy"
@@ -253,17 +134,21 @@ def main(
     stats_only: bool = typer.Option(
         False, "--stats", "-s", help="Do not run tests, just collect stats on completed tests"
     ),
+    diffs_only: bool = typer.Option(False, "--diffs", help="Just diff the provided stats dirs"),
     tries: int = typer.Option(2, "--tries", "-r", help="Number of tries for running tests"),
     threads: int = typer.Option(1, "--threads", "-t", help="Number of threads to run in parallel"),
     num_tests: int = typer.Option(-1, "--num-tests", "-n", help="Number of tests to run"),
+    exercises_dir: str = typer.Option(
+        EXERCISES_DIR_DEFAULT, "--exercises-dir", help="Directory with exercise files"
+    ),
 ):
     repo = git.Repo(search_parent_directories=True)
     commit_hash = repo.head.object.hexsha[:7]
     if repo.is_dirty():
         commit_hash += "-dirty"
 
-    if len(dirnames) > 1 and not stats_only:
-        print("Only provide 1 dirname unless running with --stats")
+    if len(dirnames) > 1 and not (stats_only or diffs_only):
+        print("Only provide 1 dirname unless running with --stats or --diffs")
         return 1
 
     updated_dirnames = []
@@ -275,7 +160,10 @@ def main(
         updated_dirnames.append(dirname)
 
     if stats_only:
-        return show_stats(updated_dirnames)
+        return show_stats(updated_dirnames, graphs)
+
+    if diffs_only:
+        return show_diffs(updated_dirnames)
 
     assert len(updated_dirnames) == 1, updated_dirnames
     dirname = updated_dirnames[0]
@@ -285,12 +173,13 @@ def main(
         return
 
     assert BENCHMARK_DNAME.exists() and BENCHMARK_DNAME.is_dir(), BENCHMARK_DNAME
-    assert ORIGINAL_DNAME.exists() and ORIGINAL_DNAME.is_dir(), ORIGINAL_DNAME
+    original_dname = BENCHMARK_DNAME / exercises_dir
+    assert original_dname.exists() and original_dname.is_dir(), original_dname
 
     if clean and dirname.exists():
         print("Cleaning up and replacing", dirname)
         dir_files = set(fn.name for fn in dirname.glob("*"))
-        original_files = set(fn.name for fn in ORIGINAL_DNAME.glob("*"))
+        original_files = set(fn.name for fn in original_dname.glob("*"))
         if dir_files != original_files:
             print("ERROR: will not delete dir that does not look like original tests", dirname)
             return
@@ -303,12 +192,15 @@ def main(
         dirname.rename(dest)
 
     if not dirname.exists():
-        shutil.copytree(ORIGINAL_DNAME, dirname)
+        print(f"Copying {original_dname} -> {dirname} ...")
+        shutil.copytree(original_dname, dirname)
+        print("...done")
 
     test_dnames = sorted(os.listdir(dirname))
 
-    if keyword:
-        test_dnames = [dn for dn in test_dnames if keyword in dn]
+    if keywords:
+        keywords = keywords.split(",")
+        test_dnames = [dn for dn in test_dnames for keyword in keywords if keyword in dn]
 
     random.shuffle(test_dnames)
     if num_tests > 0:
@@ -318,6 +210,7 @@ def main(
         all_results = []
         for testname in test_dnames:
             results = run_test(
+                original_dname,
                 dirname / testname,
                 model,
                 edit_format,
@@ -326,6 +219,8 @@ def main(
                 no_aider,
                 verbose,
                 commit_hash,
+                replay,
+                max_apply_update_errors,
             )
 
             all_results.append(results)
@@ -334,6 +229,7 @@ def main(
         run_test_threaded = lox.thread(threads)(run_test)
         for testname in test_dnames:
             run_test_threaded.scatter(
+                original_dname,
                 dirname / testname,
                 model,
                 edit_format,
@@ -342,6 +238,8 @@ def main(
                 no_aider,
                 verbose,
                 commit_hash,
+                replay,
+                max_apply_update_errors,
             )
         all_results = run_test_threaded.gather(tqdm=True)
 
@@ -353,14 +251,57 @@ def main(
     return 0
 
 
-def summarize_results(dirname):
-    res = SimpleNamespace()
+def show_diffs(dirnames):
+    dirnames = sorted(dirnames)
+
+    all_results = dict((dirname, load_results(dirname)) for dirname in dirnames)
+    testcases = set()
+    for results in all_results.values():
+        testcases.update(result["testcase"] for result in results)
+
+    testcases = sorted(testcases)
+
+    unchanged = set()
+
+    for testcase in testcases:
+        all_outcomes = []
+        for dirname in dirnames:
+            results = all_results[dirname]
+            result = [r for r in results if r["testcase"] == testcase][0]
+
+            outcomes = tuple(result["tests_outcomes"])
+            all_outcomes.append(True in outcomes)
+
+        if len(set(all_outcomes)) == 1:
+            unchanged.add(testcase)
+            continue
+
+        print()
+        print(testcase)
+        for outcome, dirname in zip(all_outcomes, dirnames):
+            print(outcome, f"{dirname}/{testcase}/.aider.chat.history.md")
+
+    changed = set(testcases) - unchanged
+    print()
+    print("changed:", len(changed), ",".join(sorted(changed)))
+    print()
+    print("unchanged:", len(unchanged), ",".join(sorted(unchanged)))
+
+
+def load_results(dirname):
     dirname = Path(dirname)
-    res.total_tests = len(list(dirname.glob("*")))
     all_results = [json.loads(fname.read_text()) for fname in dirname.glob("*/.aider.results.json")]
+    return all_results
+
+
+def summarize_results(dirname):
+    all_results = load_results(dirname)
+
+    res = SimpleNamespace()
+    res.total_tests = len(list(Path(dirname).glob("*")))
 
     try:
-        tries = max(len(results["tests_outcomes"]) for results in all_results if results)
+        tries = max(len(results.get("tests_outcomes", [])) for results in all_results if results)
     except ValueError:
         tries = 0
 
@@ -375,6 +316,11 @@ def summarize_results(dirname):
     res.user_asks = 0
     res.test_timeouts = 0
     res.exhausted_context_windows = 0
+    res.num_malformed_responses = 0
+    res.num_with_malformed_responses = 0
+    res.syntax_errors = 0
+    res.indentation_errors = 0
+    res.lazy_comments = 0
 
     variants = defaultdict(set)
 
@@ -383,30 +329,60 @@ def summarize_results(dirname):
             continue
 
         res.completed_tests += 1
-        passed = results["tests_outcomes"][-1]
+        tests_outcomes = results.get("tests_outcomes", [])
+        passed = tests_outcomes and tests_outcomes[-1]
         if passed:
-            for i in range(len(results["tests_outcomes"]) - 1, tries):
+            for i in range(len(tests_outcomes) - 1, tries):
                 passed_tests[i] += 1
 
-        res.cost += results["cost"]
-        res.duration += results["duration"]
+        res.cost += results.get("cost", 0)
+        res.duration += results.get("duration", 0)
         res.test_timeouts += results.get("test_timeouts", 0)
 
         res.error_outputs += results.get("num_error_outputs", 0)
         res.user_asks += results.get("num_user_asks", 0)
         res.exhausted_context_windows += results.get("num_exhausted_context_windows", 0)
+        res.num_malformed_responses += results.get("num_malformed_responses", 0)
+        if results.get("num_malformed_responses"):
+            res.num_with_malformed_responses += 1
+        res.lazy_comments += results.get("lazy_comments", 0)
+
+        res.syntax_errors += results.get("syntax_errors", 0)
+        res.indentation_errors += results.get("indentation_errors", 0)
 
         for key in "model edit_format commit_hash".split():
             val = results.get(key)
-            variants[key].add(val)
+            if val:
+                variants[key].add(val)
 
     if not res.completed_tests:
         return
 
+    # if res.completed_tests < 133:
+    #    return
+
     console = Console(highlight=False)
     console.rule(title=str(dirname))
 
-    console.print(f"test-cases: {res.completed_tests}")
+    commit_hashes = variants["commit_hash"]
+    versions = get_versions(commit_hashes)
+    date = dirname.name[:10]
+
+    def show(stat, red="red"):
+        val = getattr(res, stat)
+        style = red if val else None
+        console.print(f"  {stat}: {val}", style=style)
+
+    percents = dict()
+    for i in range(tries):
+        pass_rate = 100 * passed_tests[i] / res.completed_tests
+        percents[i] = pass_rate
+        # console.print(f"{pass_rate:.1f}% correct after try {i+1}")
+        setattr(res, f"pass_rate_{i+1}", f"{pass_rate:.1f}")
+
+    print(f"- dirname: {dirname.name}")
+    style = None if res.completed_tests in NUM_TESTS else "red"
+    console.print(f"  test_cases: {res.completed_tests}", style=style)
     for key, val in variants.items():
         if len(val) > 1:
             style = "red"
@@ -414,32 +390,42 @@ def summarize_results(dirname):
             style = None
         val = ", ".join(map(str, val))
         setattr(res, key, val)
-        console.print(f"{key}: {val}", style=style)
-    print("num_error_outputs:", res.error_outputs)
-    print("num_user_asks:", res.user_asks)
+        console.print(f"  {key}: {val}", style=style)
 
-    style = "red" if res.exhausted_context_windows else None
-    console.print("num_exhausted_context_windows", res.exhausted_context_windows, style=style)
-
-    style = "red" if res.test_timeouts else None
-    console.print("test_timeouts:", res.test_timeouts, style=style)
-
-    console.print()
     for i in range(tries):
-        pass_rate = 100 * passed_tests[i] / res.completed_tests
-        console.print(f"{pass_rate:.1f}% correct after try {i}")
-        setattr(res, f"pass_rate_{i+1}", pass_rate)
+        print(f"  pass_rate_{i+1}: {percents[i]:.1f}")
 
-    console.print()
+    pct_well_formed = 1.0 - res.num_with_malformed_responses / res.completed_tests
+    print(f"  percent_cases_well_formed: {pct_well_formed*100:.1f}")
+
+    show("error_outputs")
+    show("num_malformed_responses")
+    show("num_with_malformed_responses")
+    show("user_asks")
+    show("lazy_comments")
+    show("syntax_errors")
+    show("indentation_errors")
+    show("exhausted_context_windows")
+    show("test_timeouts")
+
+    a_model = set(variants["model"]).pop()
+    command = f"aider --model {a_model}"
+    print(f"  command: {command}")
+
+    print(f"  date: {date}")
+    print("  versions:", ",".join(versions))
+
     res.avg_duration = res.duration / res.completed_tests
+    print(f"  seconds_per_case: {res.avg_duration:.1f}")
 
-    console.print(f"duration: {res.avg_duration:.1f} sec/test-case")
+    print(f"  total_cost: {res.cost:.4f}")
 
     res.avg_cost = res.cost / res.completed_tests
 
     projected_cost = res.avg_cost * res.total_tests
 
-    console.print(
+    print()
+    print(
         f"costs: ${res.avg_cost:.4f}/test-case, ${res.cost:.2f} total,"
         f" ${projected_cost:.2f} projected"
     )
@@ -450,8 +436,66 @@ def summarize_results(dirname):
     return res
 
 
-def run_test(
-    testdir, model_name, edit_format, tries, no_unit_tests, no_aider, verbose, commit_hash
+def get_versions(commit_hashes):
+    versions = set()
+    for hsh in commit_hashes:
+        if not hsh:
+            continue
+        hsh = hsh.split("-")[0]
+        try:
+            version = subprocess.check_output(
+                ["git", "show", f"{hsh}:aider/__init__.py"], universal_newlines=True
+            )
+            version = re.search(r'__version__ = "(.*)"', version).group(1)
+            versions.add(version)
+        except subprocess.CalledProcessError:
+            pass
+    return versions
+
+
+def get_replayed_content(replay_dname, test_dname):
+    replay_dname = Path(replay_dname)
+    test_dname = Path(test_dname)
+    dump(replay_dname, test_dname)
+
+    test_name = test_dname.name
+    replay_fname = replay_dname / test_name / ".aider.chat.history.md"
+    dump(replay_fname)
+
+    res = replay_fname.read_text()
+    return res
+
+    res = res.splitlines(keepends=True)
+    res = [line for line in res if not line.startswith("> ") and not line.startswith("#### ")]
+    return "".join(res)
+
+
+def run_test(original_dname, testdir, *args, **kwargs):
+    try:
+        return run_test_real(original_dname, testdir, *args, **kwargs)
+    except Exception as err:
+        print("=" * 40)
+        print("Test failed")
+        print(err)
+        traceback.print_exc()
+
+        testdir = Path(testdir)
+        results_fname = testdir / ".aider.results.json"
+        results_fname.write_text(json.dumps(dict(exception=str(err))))
+
+
+def run_test_real(
+    original_dname,
+    testdir,
+    model_name,
+    edit_format,
+    tries,
+    no_unit_tests,
+    no_aider,
+    verbose,
+    commit_hash,
+    replay,
+    max_apply_update_errors,
 ):
     if not os.path.isdir(testdir):
         print("Not a dir:", testdir)
@@ -472,12 +516,17 @@ def run_test(
 
     fnames = []
     for fname in testdir.glob("*"):
-        if "test" not in fname.name and fname.is_file() and fname.name[0] != ".":
+        if (
+            "test" not in fname.name
+            and fname.is_file()
+            and fname.name[0] != "."
+            and fname.suffix == ".py"
+        ):
             fnames.append(fname)
 
             # restore the original file, in case we interrupted a prev run
             # after it had saved changes
-            original_fname = ORIGINAL_DNAME / testdir.name / fname.name
+            original_fname = original_dname / testdir.name / fname.name
             shutil.copy(original_fname, fname)
 
     file_list = " ".join(fname.name for fname in fnames)
@@ -508,8 +557,6 @@ def run_test(
     show_fnames = ",".join(map(str, fnames))
     print("fnames:", show_fnames)
 
-    openai.api_key = os.environ["OPENAI_API_KEY"]
-
     coder = Coder.create(
         main_model,
         edit_format,
@@ -520,16 +567,39 @@ def run_test(
         pretty=False,
         verbose=verbose,
     )
+    coder.max_apply_update_errors = max_apply_update_errors
 
     timeouts = 0
+
+    syntax_errors = 0
+    indentation_errors = 0
+    lazy_comments = 0
 
     dur = 0
     test_outcomes = []
     for i in range(tries):
         start = time.time()
-        if not no_aider:
-            coder.run(with_message=instructions)
+        if no_aider:
+            pass
+        elif replay:
+            response = get_replayed_content(replay, testdir)
+            coder.partial_response_content = response
+
+            show = response.splitlines(keepends=True)
+            show = [">> " + line for line in show]
+            io.append_chat_history("".join(show))
+
+            coder.apply_updates()
+        else:
+            response = coder.run(with_message=instructions)
         dur += time.time() - start
+
+        if not no_aider:
+            pat = r"^[+]? *[#].* [.][.][.] "
+            # Count the number of lines that match pat in response
+            dump(response)
+            lazy_comments += len(re.findall(pat, response, re.MULTILINE))
+            dump(lazy_comments)
 
         if coder.last_keyboard_interrupt:
             raise KeyboardInterrupt
@@ -549,7 +619,14 @@ def run_test(
             test_outcomes.append(True)
             break
 
+        if replay:
+            io.append_chat_history(errors)
+
         errors = errors.splitlines()
+
+        syntax_errors += sum(1 for line in errors if line.startswith("SyntaxError"))
+        indentation_errors += sum(1 for line in errors if line.startswith("IndentationError"))
+
         print(errors[-1])
         errors = errors[:50]
         errors = "\n".join(errors)
@@ -569,6 +646,10 @@ def run_test(
         num_error_outputs=io.num_error_outputs,
         num_user_asks=io.num_user_asks,
         num_exhausted_context_windows=coder.num_exhausted_context_windows,
+        num_malformed_responses=coder.num_malformed_responses,
+        syntax_errors=syntax_errors,
+        indentation_errors=indentation_errors,
+        lazy_comments=lazy_comments,  # Add the count of pattern matches to the results
         chat_hashes=list(
             zip(
                 coder.chat_completion_call_hashes,
@@ -610,7 +691,7 @@ def run_unit_tests(testdir, history_fname):
 
     success = result.returncode == 0
     res = result.stdout
-    res = cleanup_test_output(res)
+    res = cleanup_test_output(res, testdir)
 
     with history_fname.open("a") as fh:
         fh.write(f"```\n{res}\n```")
@@ -620,7 +701,7 @@ def run_unit_tests(testdir, history_fname):
         return res
 
 
-def cleanup_test_output(output):
+def cleanup_test_output(output, testdir):
     # remove timing info, to avoid randomizing the response to GPT
     res = re.sub(
         r"^Ran \d+ tests in \d+\.\d+s$",
@@ -640,6 +721,8 @@ def cleanup_test_output(output):
         res,
         flags=re.MULTILINE,
     )
+
+    res = res.replace(str(testdir), str(testdir.name))
     return res
 
 

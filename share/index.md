@@ -1,3 +1,6 @@
+---
+nav_exclude: true
+---
 
 # Shared aider chat transcript
 
@@ -5,6 +8,11 @@ A user has shared the following transcript of a pair programming chat session
 created using <a href="https://aider.chat">aider</a>.
 Aider is a command line tool that lets you pair program with GPT-3.5 or
 GPT-4, to edit code stored in your local git repository.
+
+The transcript is based on <a id="mdurl" href="">this chat transcript data</a>.
+
+<div class="chat-transcript" id="shared-transcript">
+</div>
 
 ## Transcript format
 
@@ -28,11 +36,6 @@ print("goodbye")
 ```
 </div>
 
-## Shared chat transcript
-
-<div class="chat-transcript" id="shared-transcript">
-</div>
-
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <script>
 window.onload = function() {
@@ -41,6 +44,7 @@ window.onload = function() {
     if (!conv) {
         return;
     }
+    document.getElementById('mdurl').href = conv;
     // Check if the URL is a non-raw GitHub gist
     var gistRegex = /^https:\/\/gist\.github\.com\/([^\/]+)\/([a-f0-9]+)$/;
     var match = gistRegex.exec(conv);
@@ -67,3 +71,4 @@ window.onload = function() {
     });
 }
 </script>
+

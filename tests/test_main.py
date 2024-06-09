@@ -4,7 +4,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import git
 from prompt_toolkit.input import DummyInput
@@ -13,7 +13,7 @@ from prompt_toolkit.output import DummyOutput
 from aider.dump import dump  # noqa: F401
 from aider.io import InputOutput
 from aider.main import check_gitignore, main, setup_git
-from tests.utils import make_repo
+from aider.utils import GitTemporaryDirectory, make_repo
 
 
 class TestMain(TestCase):
@@ -22,14 +22,10 @@ class TestMain(TestCase):
         self.original_cwd = os.getcwd()
         self.tempdir = tempfile.mkdtemp()
         os.chdir(self.tempdir)
-        self.patcher = patch("aider.coders.base_coder.check_model_availability")
-        self.mock_check = self.patcher.start()
-        self.mock_check.return_value = True
 
     def tearDown(self):
         os.chdir(self.original_cwd)
         shutil.rmtree(self.tempdir, ignore_errors=True)
-        self.patcher.stop()
 
     def test_main_with_empty_dir_no_files_on_command(self):
         main(["--no-git"], input=DummyInput(), output=DummyOutput())
@@ -74,7 +70,7 @@ class TestMain(TestCase):
     def test_main_with_git_config_yml(self):
         make_repo()
 
-        Path(".aider.conf.yml").write_text("no-auto-commits: true\n")
+        Path(".aider.conf.yml").write_text("auto-commits: false\n")
         with patch("aider.main.Coder.create") as MockCoder:
             main(["--yes"], input=DummyInput(), output=DummyOutput())
             _, kwargs = MockCoder.call_args
@@ -113,20 +109,23 @@ class TestMain(TestCase):
         self.assertEqual(".aider*", gitignore.read_text().splitlines()[0])
 
     def test_check_gitignore(self):
-        make_repo()
-        io = InputOutput(pretty=False, yes=True)
-        cwd = Path.cwd()
-        gitignore = cwd / ".gitignore"
+        with GitTemporaryDirectory():
+            os.environ["GIT_CONFIG_GLOBAL"] = "globalgitconfig"
 
-        self.assertFalse(gitignore.exists())
-        check_gitignore(cwd, io)
-        self.assertTrue(gitignore.exists())
+            io = InputOutput(pretty=False, yes=True)
+            cwd = Path.cwd()
+            gitignore = cwd / ".gitignore"
 
-        self.assertEqual(".aider*", gitignore.read_text().splitlines()[0])
+            self.assertFalse(gitignore.exists())
+            check_gitignore(cwd, io)
+            self.assertTrue(gitignore.exists())
 
-        gitignore.write_text("one\ntwo\n")
-        check_gitignore(cwd, io)
-        self.assertEqual("one\ntwo\n.aider*\n", gitignore.read_text())
+            self.assertEqual(".aider*", gitignore.read_text().splitlines()[0])
+
+            gitignore.write_text("one\ntwo\n")
+            check_gitignore(cwd, io)
+            self.assertEqual("one\ntwo\n.aider*\n", gitignore.read_text())
+            del os.environ["GIT_CONFIG_GLOBAL"]
 
     def test_main_git_ignore(self):
         cwd = Path().cwd()
@@ -178,3 +177,63 @@ class TestMain(TestCase):
             main(["--dirty-commits"], input=DummyInput())
             _, kwargs = MockCoder.call_args
             assert kwargs["dirty_commits"] is True
+
+    def test_message_file_flag(self):
+        message_file_content = "This is a test message from a file."
+        message_file_path = tempfile.mktemp()
+        with open(message_file_path, "w", encoding="utf-8") as message_file:
+            message_file.write(message_file_content)
+
+        with patch("aider.main.Coder.create") as MockCoder:
+            MockCoder.return_value.run = MagicMock()
+            main(
+                ["--yes", "--message-file", message_file_path],
+                input=DummyInput(),
+                output=DummyOutput(),
+            )
+            MockCoder.return_value.run.assert_called_once_with(with_message=message_file_content)
+
+        os.remove(message_file_path)
+
+    def test_encodings_arg(self):
+        fname = "foo.py"
+
+        with GitTemporaryDirectory():
+            with patch("aider.main.Coder.create") as MockCoder:  # noqa: F841
+                with patch("aider.main.InputOutput") as MockSend:
+
+                    def side_effect(*args, **kwargs):
+                        self.assertEqual(kwargs["encoding"], "iso-8859-15")
+                        return MagicMock()
+
+                    MockSend.side_effect = side_effect
+
+                    main(["--yes", fname, "--encoding", "iso-8859-15"])
+
+    @patch("aider.main.InputOutput")
+    @patch("aider.coders.base_coder.Coder.run")
+    def test_main_message_adds_to_input_history(self, mock_run, MockInputOutput):
+        test_message = "test message"
+        mock_io_instance = MockInputOutput.return_value
+
+        main(["--message", test_message], input=DummyInput(), output=DummyOutput())
+
+        mock_io_instance.add_to_input_history.assert_called_once_with(test_message)
+
+    @patch("aider.main.InputOutput")
+    @patch("aider.coders.base_coder.Coder.run")
+    def test_yes(self, mock_run, MockInputOutput):
+        test_message = "test message"
+
+        main(["--yes", "--message", test_message])
+        args, kwargs = MockInputOutput.call_args
+        self.assertTrue(args[1])
+
+    @patch("aider.main.InputOutput")
+    @patch("aider.coders.base_coder.Coder.run")
+    def test_default_yes(self, mock_run, MockInputOutput):
+        test_message = "test message"
+
+        main(["--message", test_message])
+        args, kwargs = MockInputOutput.call_args
+        self.assertEqual(args[1], None)

@@ -1,6 +1,6 @@
-from pathlib import Path
 
 from aider import diffs
+from pathlib import Path
 
 from ..dump import dump  # noqa: F401
 from .base_coder import Coder
@@ -8,6 +8,8 @@ from .wholefile_prompts import WholeFilePrompts
 
 
 class WholeFileCoder(Coder):
+    edit_format = "whole"
+
     def __init__(self, *args, **kwargs):
         self.gpt_prompts = WholeFilePrompts()
         super().__init__(*args, **kwargs)
@@ -22,11 +24,11 @@ class WholeFileCoder(Coder):
 
     def render_incremental_response(self, final):
         try:
-            return self.update_files(mode="diff")
+            return self.get_edits(mode="diff")
         except ValueError:
             return self.partial_response_content
 
-    def update_files(self, mode="update"):
+    def get_edits(self, mode="update"):
         content = self.partial_response_content
 
         chat_files = self.get_inchat_relative_files()
@@ -46,7 +48,7 @@ class WholeFileCoder(Coder):
                     # ending an existing block
                     saw_fname = None
 
-                    full_path = (Path(self.root) / fname).absolute()
+                    full_path = self.abs_root_path(fname)
 
                     if mode == "diff":
                         output += self.do_live_diff(full_path, new_lines, True)
@@ -63,6 +65,8 @@ class WholeFileCoder(Coder):
                     fname_source = "block"
                     fname = lines[i - 1].strip()
                     fname = fname.strip("*")  # handle **filename.py**
+                    fname = fname.rstrip(":")
+                    fname = fname.strip("`")
 
                     # Did gpt prepend a bogus dir? It especially likes to
                     # include the path/to prefix from the one-shot example in
@@ -104,25 +108,30 @@ class WholeFileCoder(Coder):
         if fname:
             edits.append((fname, fname_source, new_lines))
 
-        edited = set()
+        seen = set()
+        refined_edits = []
         # process from most reliable filename, to least reliable
         for source in ("block", "saw", "chat"):
             for fname, fname_source, new_lines in edits:
                 if fname_source != source:
                     continue
                 # if a higher priority source already edited the file, skip
-                if fname in edited:
+                if fname in seen:
                     continue
 
-                # we have a winner
-                new_lines = "".join(new_lines)
-                if self.allowed_to_edit(fname, new_lines):
-                    edited.add(fname)
+                seen.add(fname)
+                refined_edits.append((fname, fname_source, new_lines))
 
-        return edited
+        return refined_edits
+
+    def apply_edits(self, edits):
+        for path, fname_source, new_lines in edits:
+            full_path = self.abs_root_path(path)
+            new_lines = "".join(new_lines)
+            self.io.write_text(full_path, new_lines)
 
     def do_live_diff(self, full_path, new_lines, final):
-        if full_path.exists():
+        if Path(full_path).exists():
             orig_lines = self.io.read_text(full_path).splitlines(keepends=True)
 
             show_diff = diffs.diff_partial_update(

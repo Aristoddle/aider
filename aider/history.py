@@ -1,7 +1,4 @@
 import argparse
-import json
-
-import tiktoken
 
 from aider import models, prompts
 from aider.dump import dump  # noqa: F401
@@ -9,9 +6,10 @@ from aider.sendchat import simple_send_with_retries
 
 
 class ChatSummary:
-    def __init__(self, model=models.GPT35.name, max_tokens=1024):
-        self.tokenizer = tiktoken.encoding_for_model(model)
+    def __init__(self, model=None, max_tokens=1024):
+        self.token_count = model.token_count
         self.max_tokens = max_tokens
+        self.model = model
 
     def too_big(self, messages):
         sized = self.tokenize(messages)
@@ -21,18 +19,19 @@ class ChatSummary:
     def tokenize(self, messages):
         sized = []
         for msg in messages:
-            tokens = len(self.tokenizer.encode(json.dumps(msg)))
+            tokens = self.token_count(msg)
             sized.append((tokens, msg))
         return sized
 
-    def summarize(self, messages):
-        if len(messages) <= 4:
-            return self.summarize_all(messages)
-
+    def summarize(self, messages, depth=0):
         sized = self.tokenize(messages)
         total = sum(tokens for tokens, _msg in sized)
-        if total <= self.max_tokens:
+        if total <= self.max_tokens and depth == 0:
             return messages
+
+        min_split = 4
+        if len(messages) <= min_split or depth > 3:
+            return self.summarize_all(messages)
 
         tail_tokens = 0
         split_index = len(messages)
@@ -51,19 +50,36 @@ class ChatSummary:
         while messages[split_index - 1]["role"] != "assistant" and split_index > 1:
             split_index -= 1
 
+        if split_index <= min_split:
+            return self.summarize_all(messages)
+
         head = messages[:split_index]
         tail = messages[split_index:]
 
-        summary = self.summarize_all(head)
+        sized = sized[:split_index]
+        head.reverse()
+        sized.reverse()
+        keep = []
+        total = 0
+        model_max_input_tokens = self.model.info.get("max_input_tokens", 4096) - 512
+        for i in range(split_index):
+            total += sized[i][0]
+            if total > model_max_input_tokens:
+                break
+            keep.append(head[i])
+
+        keep.reverse()
+
+        summary = self.summarize_all(keep)
 
         tail_tokens = sum(tokens for tokens, msg in sized[split_index:])
-        summary_tokens = len(self.tokenizer.encode(json.dumps(summary)))
+        summary_tokens = self.token_count(summary)
 
         result = summary + tail
         if summary_tokens + tail_tokens < self.max_tokens:
             return result
 
-        return self.summarize(result)
+        return self.summarize(result, depth + 1)
 
     def summarize_all(self, messages):
         content = ""
@@ -81,7 +97,9 @@ class ChatSummary:
             dict(role="user", content=content),
         ]
 
-        summary = simple_send_with_retries(model=models.GPT35.name, messages=messages)
+        summary = simple_send_with_retries(self.model.name, messages)
+        if summary is None:
+            raise ValueError(f"summarizer unexpectedly failed for {self.model.name}")
         summary = prompts.summary_prefix + summary
 
         return [dict(role="user", content=summary)]
@@ -92,35 +110,13 @@ def main():
     parser.add_argument("filename", help="Markdown file to parse")
     args = parser.parse_args()
 
+    model = models.Model("gpt-3.5-turbo")
+    summarizer = ChatSummary(model)
+
     with open(args.filename, "r") as f:
         text = f.read()
 
-    messages = []
-    assistant = []
-    for line in text.splitlines(keepends=True):
-        if line.startswith("# "):
-            continue
-        if line.startswith(">"):
-            continue
-        if line.startswith("#### /"):
-            continue
-
-        if line.startswith("#### "):
-            if assistant:
-                assistant = "".join(assistant)
-                if assistant.strip():
-                    messages.append(dict(role="assistant", content=assistant))
-                assistant = []
-
-            content = line[5:]
-            if content.strip() and content.strip() != "<blank>":
-                messages.append(dict(role="user", content=line[5:]))
-            continue
-
-        assistant.append(line)
-
-    summarizer = ChatSummary(models.GPT35.name)
-    summary = summarizer.summarize(messages[-40:])
+    summary = summarizer.summarize_chat_history_markdown(text)
     dump(summary)
 
 

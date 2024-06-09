@@ -5,36 +5,33 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from aider import models
 from aider.coders import Coder
 from aider.coders import editblock_coder as eb
 from aider.dump import dump  # noqa: F401
 from aider.io import InputOutput
+from aider.models import Model
 
 
 class TestUtils(unittest.TestCase):
     def setUp(self):
-        self.patcher = patch("aider.coders.base_coder.check_model_availability")
-        self.mock_check = self.patcher.start()
-        self.mock_check.return_value = True
+        self.GPT35 = Model("gpt-3.5-turbo")
 
-    def tearDown(self):
-        self.patcher.stop()
-
-    def test_replace_most_similar_chunk(self):
+    # fuzzy logic disabled v0.11.2-dev
+    def __test_replace_most_similar_chunk(self):
         whole = "This is a sample text.\nAnother line of text.\nYet another line.\n"
-        part = "This is a sample text"
-        replace = "This is a replaced text."
-        expected_output = "This is a replaced text..\nAnother line of text.\nYet another line.\n"
+        part = "This is a sample text\n"
+        replace = "This is a replaced text.\n"
+        expected_output = "This is a replaced text.\nAnother line of text.\nYet another line.\n"
 
         result = eb.replace_most_similar_chunk(whole, part, replace)
         self.assertEqual(result, expected_output)
 
-    def test_replace_most_similar_chunk_not_perfect_match(self):
-        whole = "This is a sample text.\nAnother line of text.\nYet another line."
-        part = "This was a sample text.\nAnother line of txt"
-        replace = "This is a replaced text.\nModified line of text."
-        expected_output = "This is a replaced text.\nModified line of text.\nYet another line."
+    # fuzzy logic disabled v0.11.2-dev
+    def __test_replace_most_similar_chunk_not_perfect_match(self):
+        whole = "This is a sample text.\nAnother line of text.\nYet another line.\n"
+        part = "This was a sample text.\nAnother line of txt\n"
+        replace = "This is a replaced text.\nModified line of text.\n"
+        expected_output = "This is a replaced text.\nModified line of text.\nYet another line.\n"
 
         result = eb.replace_most_similar_chunk(whole, part, replace)
         self.assertEqual(result, expected_output)
@@ -65,11 +62,11 @@ Here's the change:
 
 ```text
 foo.txt
-<<<<<<< ORIGINAL
+<<<<<<< SEARCH
 Two
 =======
 Tooooo
->>>>>>> UPDATED
+>>>>>>> REPLACE
 ```
 
 Hope you like it!
@@ -78,17 +75,40 @@ Hope you like it!
         edits = list(eb.find_original_update_blocks(edit))
         self.assertEqual(edits, [("foo.txt", "Two\n", "Tooooo\n")])
 
+    def test_find_original_update_blocks_mangled_filename_w_source_tag(self):
+        source = "source"
+
+        edit = """
+Here's the change:
+
+<%s>foo.txt
+<<<<<<< SEARCH
+One
+=======
+Two
+>>>>>>> REPLACE
+</%s>
+
+Hope you like it!
+""" % (source, source)
+
+        fence = ("<%s>" % source, "</%s>" % source)
+
+        with self.assertRaises(ValueError) as cm:
+            _edits = list(eb.find_original_update_blocks(edit, fence))
+        self.assertIn("missing filename", str(cm.exception))
+
     def test_find_original_update_blocks_quote_below_filename(self):
         edit = """
 Here's the change:
 
 foo.txt
 ```text
-<<<<<<< ORIGINAL
+<<<<<<< SEARCH
 Two
 =======
 Tooooo
->>>>>>> UPDATED
+>>>>>>> REPLACE
 ```
 
 Hope you like it!
@@ -103,7 +123,7 @@ Here's the change:
 
 ```text
 foo.txt
-<<<<<<< ORIGINAL
+<<<<<<< SEARCH
 Two
 =======
 Tooooo
@@ -121,7 +141,7 @@ oops!
 Here's the change:
 
 ```text
-<<<<<<< ORIGINAL
+<<<<<<< SEARCH
 Two
 =======
 Tooooo
@@ -137,34 +157,34 @@ oops!
     def test_find_original_update_blocks_no_final_newline(self):
         edit = """
 aider/coder.py
-<<<<<<< ORIGINAL
+<<<<<<< SEARCH
             self.console.print("[red]^C again to quit")
 =======
             self.io.tool_error("^C again to quit")
->>>>>>> UPDATED
+>>>>>>> REPLACE
 
 aider/coder.py
-<<<<<<< ORIGINAL
+<<<<<<< SEARCH
             self.io.tool_error("Malformed ORIGINAL/UPDATE blocks, retrying...")
             self.io.tool_error(err)
 =======
             self.io.tool_error("Malformed ORIGINAL/UPDATE blocks, retrying...")
             self.io.tool_error(str(err))
->>>>>>> UPDATED
+>>>>>>> REPLACE
 
 aider/coder.py
-<<<<<<< ORIGINAL
+<<<<<<< SEARCH
             self.console.print("[red]Unable to get commit message from gpt-3.5-turbo. Use /commit to try again.\n")
 =======
             self.io.tool_error("Unable to get commit message from gpt-3.5-turbo. Use /commit to try again.")
->>>>>>> UPDATED
+>>>>>>> REPLACE
 
 aider/coder.py
-<<<<<<< ORIGINAL
+<<<<<<< SEARCH
             self.console.print("[red]Skipped commmit.")
 =======
             self.io.tool_error("Skipped commmit.")
->>>>>>> UPDATED"""
+>>>>>>> REPLACE"""
 
         # Should not raise a ValueError
         list(eb.find_original_update_blocks(edit))
@@ -175,7 +195,7 @@ No problem! Here are the changes to patch `subprocess.check_output` instead of `
 
 ```python
 tests/test_repomap.py
-<<<<<<< ORIGINAL
+<<<<<<< SEARCH
     def test_check_for_ctags_failure(self):
         with patch("subprocess.run") as mock_run:
             mock_run.side_effect = Exception("ctags not found")
@@ -183,9 +203,9 @@ tests/test_repomap.py
     def test_check_for_ctags_failure(self):
         with patch("subprocess.check_output") as mock_check_output:
             mock_check_output.side_effect = Exception("ctags not found")
->>>>>>> UPDATED
+>>>>>>> REPLACE
 
-<<<<<<< ORIGINAL
+<<<<<<< SEARCH
     def test_check_for_ctags_success(self):
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = CompletedProcess(args=["ctags", "--version"], returncode=0, stdout='''{
@@ -205,7 +225,7 @@ tests/test_repomap.py
   "pattern": "/^    status = main()$/",
   "kind": "variable"
 }'''
->>>>>>> UPDATED
+>>>>>>> REPLACE
 ```
 
 These changes replace the `subprocess.run` patches with `subprocess.check_output` patches in both `test_check_for_ctags_failure` and `test_check_for_ctags_success` tests.
@@ -232,30 +252,39 @@ These changes replace the `subprocess.run` patches with `subprocess.check_output
     line4
 """
 
-        result = eb.replace_part_with_missing_leading_whitespace(whole, part, replace)
+        result = eb.replace_most_similar_chunk(whole, part, replace)
         self.assertEqual(result, expected_output)
 
     def test_replace_part_with_missing_leading_whitespace(self):
         whole = "    line1\n    line2\n    line3\n"
-        part = "line1\nline2"
-        replace = "new_line1\nnew_line2"
+        part = "line1\nline2\n"
+        replace = "new_line1\nnew_line2\n"
         expected_output = "    new_line1\n    new_line2\n    line3\n"
 
-        result = eb.replace_part_with_missing_leading_whitespace(whole, part, replace)
+        result = eb.replace_most_similar_chunk(whole, part, replace)
         self.assertEqual(result, expected_output)
 
-    def test_replace_part_with_missing_leading_whitespace_including_blank_lines(self):
+    def test_replace_part_with_just_some_missing_leading_whitespace(self):
+        whole = "    line1\n    line2\n    line3\n"
+        part = " line1\n line2\n"
+        replace = " new_line1\n     new_line2\n"
+        expected_output = "    new_line1\n        new_line2\n    line3\n"
+
+        result = eb.replace_most_similar_chunk(whole, part, replace)
+        self.assertEqual(result, expected_output)
+
+    def test_replace_part_with_missing_leading_whitespace_including_blank_line(self):
         """
         The part has leading whitespace on all lines, so should be ignored.
         But it has a *blank* line with no whitespace at all, which was causing a
         bug per issue #25. Test case to repro and confirm fix.
         """
         whole = "    line1\n    line2\n    line3\n"
-        part = "\n  line1\n  line2"
-        replace = "new_line1\nnew_line2"
-        expected_output = None
+        part = "\n  line1\n  line2\n"
+        replace = "  new_line1\n  new_line2\n"
+        expected_output = "    new_line1\n    new_line2\n    line3\n"
 
-        result = eb.replace_part_with_missing_leading_whitespace(whole, part, replace)
+        result = eb.replace_most_similar_chunk(whole, part, replace)
         self.assertEqual(result, expected_output)
 
     def test_full_edit(self):
@@ -268,23 +297,24 @@ These changes replace the `subprocess.run` patches with `subprocess.check_output
         files = [file1]
 
         # Initialize the Coder object with the mocked IO and mocked repo
-        coder = Coder.create(models.GPT4, "diff", io=InputOutput(), fnames=files)
+        coder = Coder.create(self.GPT35, "diff", io=InputOutput(), fnames=files)
 
         def mock_send(*args, **kwargs):
             coder.partial_response_content = f"""
 Do this:
 
 {Path(file1).name}
-<<<<<<< ORIGINAL
+<<<<<<< SEARCH
 two
 =======
 new
->>>>>>> UPDATED
+>>>>>>> REPLACE
 
 """
             coder.partial_response_function_call = dict()
+            return []
 
-        coder.send = MagicMock(side_effect=mock_send)
+        coder.send = mock_send
 
         # Call the run method with a message
         coder.run(with_message="hi")
@@ -305,7 +335,7 @@ new
 
         # Initialize the Coder object with the mocked IO and mocked repo
         coder = Coder.create(
-            models.GPT4,
+            self.GPT35,
             "diff",
             io=InputOutput(dry_run=True),
             fnames=files,
@@ -317,22 +347,56 @@ new
 Do this:
 
 {Path(file1).name}
-<<<<<<< ORIGINAL
+<<<<<<< SEARCH
 two
 =======
 new
->>>>>>> UPDATED
+>>>>>>> REPLACE
 
 """
             coder.partial_response_function_call = dict()
+            return []
 
-        coder.send = MagicMock(side_effect=mock_send)
+        coder.send = mock_send
 
         # Call the run method with a message
         coder.run(with_message="hi")
 
         content = Path(file1).read_text(encoding="utf-8")
         self.assertEqual(content, orig_content)
+
+    def test_find_original_update_blocks_mupltiple_same_file(self):
+        edit = """
+Here's the change:
+
+```text
+foo.txt
+<<<<<<< SEARCH
+one
+=======
+two
+>>>>>>> REPLACE
+
+...
+
+<<<<<<< SEARCH
+three
+=======
+four
+>>>>>>> REPLACE
+```
+
+Hope you like it!
+"""
+
+        edits = list(eb.find_original_update_blocks(edit))
+        self.assertEqual(
+            edits,
+            [
+                ("foo.txt", "one\n", "two\n"),
+                ("foo.txt", "three\n", "four\n"),
+            ],
+        )
 
 
 if __name__ == "__main__":
